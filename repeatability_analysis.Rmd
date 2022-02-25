@@ -1,0 +1,2728 @@
+---
+title: "Repeatability analysis"
+output: html_document
+---
+
+
+```{r echo = F}
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      # record the current time before each chunk
+      now <<- Sys.time()
+    } else {
+      # calculate the time difference after a chunk
+      res <- difftime(Sys.time(), now, units = "mins")
+      # return a character string to show the time
+     paste("This chunk took", round(res, 2), "minutes")
+    }
+  }
+}))
+
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = '100%',  fig.align = "center", message = FALSE, warning = FALSE, fig.height = 4, fig.width =6, time_it = TRUE, error = FALSE)
+```
+
+
+## Load packages
+
+```{r load packages}
+
+library(phyloseq)
+library(ggplot2)
+library(expss)
+library(brms)
+library(MCMCglmm)
+library(QGglmm)
+library(tidyverse)
+library(GGally)
+library(vegan)
+library(ggpubr)
+library(pheatmap)
+library(lubridate)
+library(ggsci)
+library(RColorBrewer)
+library(microbiome)
+library(vegan)
+library(lme4)
+library(performance)
+library(ggrepel)
+library(rptR)
+library(codyn)
+library(glmmTMB)
+library(speedyseq)
+library(ggeffects)
+library(MuMIn)
+library(effects)
+library(broom)
+library(rptGam)
+library(ggthemes)
+library(phylosignal)
+library(ggtree)
+#library(iccCounts)
+#library(NBZIMM)
+
+memory.limit(1000000)
+
+```
+
+
+```{r}
+sessionInfo()
+
+start_time<-Sys.time()
+```
+
+
+```{r, echo = FALSE}
+prevalence <- function(physeq, add_tax = TRUE){
+  
+  ## Check if taxa are rows
+  trows <- taxa_are_rows(physeq)
+  
+  ## Extract OTU table
+  otutab <- as.data.frame(otu_table(physeq))
+  
+  ## Transpose OTU table (species should be arranged by rows)
+  if(trows == FALSE){
+    otutab <- t(otutab)
+  }
+  
+  ## Estimate prevalence (number of samples with OTU present)
+  prevdf <- apply(X = otutab,
+                  #MARGIN = ifelse(trows, yes = 1, no = 2),  # for a non-transposed data
+                  MARGIN = 1,
+                  FUN = function(x){sum(x > 0)})
+  
+  ## Add total and average read counts per OTU
+  prevdf <- data.frame(Prevalence = prevdf,
+                       TotalAbundance = taxa_sums(physeq),
+                       MeanAbundance = rowMeans(otutab),
+                       MedianAbundance = apply(otutab, 1, median))
+  
+  ## Add taxonomy table
+  if(add_tax == TRUE && !is.null(tax_table(physeq, errorIfNULL = F))){
+    prevdf <- cbind(prevdf, tax_table(physeq))
+  }
+  return(prevdf)
+}
+
+
+
+
+```
+
+# Details
+Model structure: https://stats.stackexchange.com/questions/114848/negative-binomial-glm-vs-log-transforming-for-count-data-increased-type-i-erro
+
+
+# 1. Data cleaning
+
+```{r}
+
+#meerkat_final<-readRDS("C:\\Users\\risel\\Dropbox\\Sommer postdoc\\Meerkat project\\PROJECTS\\MeerkatSpikeInData\\Analysis updated\\DATA\\meerkat_unrarefied.rds")
+
+meerkat_final<-readRDS("C:\\Users\\risel\\Dropbox\\Sommer postdoc\\Meerkat project\\PROJECTS\\MeerkatSpikeInData\\Analysis updated\\1. TEMPORAL DYNAMICS ANALYSIS\\1_PUBLISHED DATASET AND CODE\\processed_data_phyloseq.rds")
+
+sample_data(meerkat_final)
+
+asv_table<-data.frame(meerkat_final@otu_table@.Data)
+asv_table[1:5,1:5]
+names(asv_table)<-sample_data(meerkat_final)$feature.id
+meerkat_normalized<-sweep(asv_table, MARGIN=2, sample_data(meerkat_final)$scaling_factor, `*`)
+meerkat_normalized<-round(meerkat_normalized, digits = 0)
+meerkat_normalized<-otu_table(meerkat_normalized, taxa_are_rows = TRUE)
+meerkat_scaled<-meerkat_final
+otu_table(meerkat_scaled)<-meerkat_normalized
+
+### add total abundance of reads to dataframe
+sample_data(meerkat_scaled)$TotalAbundance<-sample_sums(meerkat_scaled)
+
+
+meerkat_filtered<-subset_samples(meerkat_scaled, Seq_depth_nospikein >5000)
+
+head(sample_data(meerkat_filtered))
+
+# Hydrological year
+
+sample_data(meerkat_filtered)$HydroDate<-sample_data(meerkat_filtered)$SampleDate -92 # shift year back three months to reflect hydrological year (beginning of wet season)
+sample_data(meerkat_filtered)$Year<-factor(lubridate::year(sample_data(meerkat_filtered)$HydroDate))
+
+```
+
+
+* Only keep meerkats with over 1 sample
+
+```{r}
+
+samplecount<-data.frame(sample_data(meerkat_filtered)) %>% 
+  group_by(IndividID) %>% 
+  summarise(NoSamples = n())
+
+samplecount<-samplecount%>%arrange(IndividID, -NoSamples)
+
+sample_data(meerkat_filtered)$SampleCount<-vlookup(sample_data(meerkat_filtered)$IndividID, samplecount, lookup_column = "IndividID", result_column = "NoSamples")
+
+
+meerkat_filtered<-subset_samples(meerkat_filtered, SampleCount >1)
+length(unique(sample_data(meerkat_filtered)$IndividID))
+
+summary(sample_data(meerkat_filtered)$SampleCount)
+
+
+################################
+
+min_age_df<-data.frame(sample_data(meerkat_filtered)) %>% group_by(IndividID) %>% summarize(min_age=min(AgeAtSamplingYears))
+max_age_df<-data.frame(sample_data(meerkat_filtered)) %>% group_by(IndividID) %>% summarize(max_age=max(AgeAtSamplingYears))
+
+age_analysis<-merge(min_age_df, max_age_df, by = "IndividID")
+
+age_analysis$AgeSpan<-age_analysis$max_age - age_analysis$min_age
+
+summary(age_analysis$AgeSpan)
+mean(age_analysis$AgeSpan)
+sd(age_analysis$AgeSpan)
+hist(age_analysis$AgeSpan, breaks = 30)
+
+```
+
+## 2. Generate datasets 
+
+```{r}
+
+################ ASV LEVEL ##########################
+################ ASV LEVEL ##########################
+################ ASV LEVEL ##########################
+################ ASV LEVEL ##########################
+################ ASV LEVEL ##########################
+
+scaled_core_asv<-microbiome::core(meerkat_filtered, detection = 0, prevalence = 0.30)
+asv_names<-taxa_names(scaled_core_asv)
+
+hist(sample_data(meerkat_filtered)$SampleCount)
+hist(sample_data(meerkat_icc_genus)$SampleCount, breaks =20)
+meerkat_icc_asv<-subset_samples(scaled_core_asv, SampleCount >3)
+
+group_count<-data.frame(table(sample_data(meerkat_icc_asv)$GroupAtSampling))
+
+group_count<-group_count %>% arrange(-Freq)
+
+groups_to_keep<-as.character(subset(group_count, Freq >5)$Var1)
+
+meerkat_icc_asv<-subset_samples(meerkat_icc_asv, GroupAtSampling %in% groups_to_keep)
+meerkat_icc_asv
+
+
+
+#######
+
+length(unique(sample_data(meerkat_icc_asv)$IndividID))
+length(unique(sample_data(meerkat_icc_asv)$GroupAtSampling))
+min(sample_data(meerkat_icc_asv)$SampleCount)
+max(sample_data(meerkat_icc_asv)$SampleCount)
+mean(sample_data(meerkat_icc_asv)$SampleCount)
+
+timeline1<-ggplot(data=sample_data(meerkat_icc_asv),aes(x=SampleDate,y=reorder(IndividID, SampleDate),group=IndividID))+
+  geom_line(size=0.5,alpha=0.5)+
+  geom_point(colour="black",pch=21,size=1.5, fill = "grey")+
+  theme_bw(base_size=14)+
+  theme(panel.grid.minor=element_blank(),
+        panel.background=element_blank(),axis.line=element_line(colour="black"))+
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())+
+  scale_x_date(date_breaks = "1 year")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1))+
+  ylab("Meerkat ID")+
+  xlab("Date")+
+  scale_y_discrete(expand=expansion(add=c(0.2,1.5)))+
+  theme(legend.position="none")
+
+
+timeline2<-ggplot(data=sample_data(meerkat_icc_asv),aes(x=AgeAtSamplingYears,y=reorder(IndividID, -AgeAtSamplingYears),group=IndividID))+
+  geom_line(size=0.5,alpha=0.5)+
+  geom_point(colour="black",pch=21,size=1.5, fill = "grey")+
+  theme_bw(base_size=14)+
+  theme(panel.grid.minor=element_blank(),
+        panel.background=element_blank(),axis.line=element_line(colour="black"))+
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())+
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1))+
+  ylab("Meerkat ID")+
+  xlab("Age (years)")+
+  scale_y_discrete(expand=expansion(add=c(0.2,1.5)))+
+  theme(legend.position="none")
+
+ggarrange(timeline2, timeline1, ncol = 1, labels = c("a)", "b)"))
+#saveRDS(meerkat_icc_asv, "meerkat_microbiome_data.RDS")
+
+
+##################################
+##################################
+##################################
+##################################
+
+scaled_core_genus_all<-speedyseq::tax_glom(meerkat_filtered, taxrank = "Genus")
+scaled_core_genus<-microbiome::core(scaled_core_genus_all, detection = 0, prevalence = 0.5)
+
+## make vector of genus names
+taxonomy<-data.frame(scaled_core_genus@tax_table@.Data)
+genus_freq<-data.frame(table(taxonomy$Genus))
+genus_freq<-genus_freq %>% arrange(-Freq)
+head(genus_freq)
+scaled_core_genus<-subset_taxa(scaled_core_genus, Genus != "uncultured")
+scaled_core_genus<-subset_taxa(scaled_core_genus, Genus != "uncultured bacterium")
+
+taxonomy<-data.frame(scaled_core_genus@tax_table@.Data)
+taxa_names(scaled_core_genus)<-taxonomy$Genus
+
+genus_names<-taxa_names(scaled_core_genus)
+#genus_names<-genus_names[-36]
+
+sum(sample_sums(scaled_core_genus))/sum(sample_sums(scaled_core_genus_all))
+
+### icc genus dataset over 4 samples####
+### icc genus dataset over 4 samples####
+### icc genus dataset over 4 samples####
+### icc genus dataset over 4 samples####
+
+meerkat_icc_genus<-subset_samples(scaled_core_genus, SampleCount >3)
+length(unique(sample_data(meerkat_icc_genus)$IndividID))
+group_count<-data.frame(table(sample_data(meerkat_icc_genus)$GroupAtSampling))
+
+group_count<-group_count %>% arrange(-Freq)
+
+groups_to_keep<-as.character(subset(group_count, Freq >5)$Var1)
+
+meerkat_icc_genus<-subset_samples(meerkat_icc_genus, GroupAtSampling %in% groups_to_keep)
+
+hist(microbiome::prevalence(meerkat_icc_genus))
+
+
+
+```
+
+## 3. Model comparison
+
+```{r eval = F}
+model_comparison_asv_list<-list()
+
+taxanames<-taxa_names(meerkat_icc_asv)
+#taxanames<-taxanames[18:length(taxanames)]
+#tax_table(meerkat_icc_asv)
+
+#microbiome::prevalence(meerkat_icc_asv)
+
+for (i in 1:length(taxanames)){
+  
+  tryCatch({ #catch errors
+    
+    print(i)
+    
+    taxa1<-prune_taxa(taxanames[i], meerkat_icc_asv)
+    # taxa1<-prune_taxa(taxanames[13], meerkat_icc_asv)
+    
+    microbiome::prevalence(taxa1)
+    sample_data(taxa1)$taxa_i_abundance<-sample_sums(taxa1)
+    metadata<-data.frame(sample_data(taxa1))
+    #metadata<-metadata[,c(variables_all, "taxa_i_abundance", "Year")]
+    
+    metadata$Seq_depth_nospikein<-as.numeric(scale( metadata$Seq_depth_nospikein))
+    metadata$HoursAfterSunrise<-as.numeric(scale( metadata$HoursAfterSunrise))
+    
+    
+    metadata<-metadata %>% arrange(IndividID, SampleDate)
+    head(metadata)
+    metadata$Year<-as.factor(lubridate::year(metadata$SampleDate))
+    metadata$JulianDate<-as.numeric(metadata$SampleDate-min(metadata$SampleDate))
+    
+    ############################## models ##############
+    ############################## models ##############
+    ############################## models ##############
+    ############################## models ##############
+    
+    #str(metadata)
+    
+    gammodel_log<-mgcv::bam(log10(taxa_i_abundance+1)~
+                              s(scale(HoursAfterSunrise), bs = "cr")+
+                              s(scale(Seq_depth_nospikein), bs = "cr")+
+                              s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                              Storage+
+                              Seq_run+
+                              Season+
+                              s(Year, bs = "re")+
+                              s(IndividID, bs = "re")+
+                              s(GroupAtSampling, bs = "re"),
+                            data=metadata,
+                            correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                            family = gaussian)
+    
+    
+    print(summary(gammodel_log))
+
+    gam_boot<-rptGam::rptgam(gamObj = gammodel_log, nboot = 10, nperm = 0)
+    
+    # ICC and CIs for ID
+    icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+    lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+    upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+    
+    
+    # ICC and CIs for social group
+    icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+    lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+    upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+    
+    # ICC and CIs for year
+    icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+    lower_year_gam<- gam_boot$rpt[6,"Year_adj"]
+    upper_year_gam<- gam_boot$rpt[8,"Year_adj"]
+    
+    
+    gam_model<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+    
+    
+    gam_model$effect<-c("Year", "ID", "Group")
+    gam_model$model<-"GAM gaussian"
+    names(gam_model)<-c("ICC", "lower", "upper", "effect", "model")
+    
+    # add p value
+    
+    gam_model$p_val<-gam_boot$lrt$p_value
+    gam_model$Significant <-gam_model$p_val < 0.051
+    
+    
+    ################ poisson rptr #####################
+    ################ poisson rptr #####################
+    ################ poisson rptr #####################
+    ################ poisson rptr #####################
+    
+    rptr_poisson_model <- rptR::rptPoisson(round(sqrt(taxa_i_abundance),0) ~
+                                             scale(HoursAfterSunrise)+
+                                            scale(Seq_depth_nospikein)+
+                                             scale(log10(AgeAtSamplingYears))+
+                                             Storage+
+                                             Season+
+                                             Seq_run+
+                                             (1 | Year)+
+                                             (1 | IndividID)+
+                                             (1 | GroupAtSampling), 
+                                           grname = c("IndividID", 
+                                                      "GroupAtSampling", 
+                                                      "Year"), 
+                                           data = metadata, 
+                                           nboot = 10, 
+                                           npermut = 0)
+    str(rptr_poisson_model)
+    
+    # ID
+    icc_id_poisson_rptr<-rptr_poisson_model$R$IndividID[2] # link scale
+    lower_id_poisson_rptr<-rptr_poisson_model$CI_emp$CI_link[1,1]
+    upper_id_poisson_rptr<-rptr_poisson_model$CI_emp$CI_link[1,2]
+    
+    ## group
+    
+    icc_group_poisson_rptr<-rptr_poisson_model$R$GroupAtSampling[2] # link scale
+    lower_group_poisson_rptr<-rptr_poisson_model$CI_emp$CI_link[2,1]
+    upper_group_poisson_rptr<-rptr_poisson_model$CI_emp$CI_link[2,2]
+    
+    # year
+    
+    icc_year_poisson_rptr<-rptr_poisson_model$R$Year[2] # link scale
+    lower_year_poisson_rptr<-rptr_poisson_model$CI_emp$CI_link[3,1]
+    upper_year_poisson_rptr<-rptr_poisson_model$CI_emp$CI_link[3,2]
+    
+
+    
+    ########################
+    ########################
+    ########################
+    
+    glm_poisson_model<-data.frame(rbind(c(icc_id_poisson_rptr, lower_id_poisson_rptr,upper_id_poisson_rptr), 
+                                        c(icc_group_poisson_rptr, lower_group_poisson_rptr, upper_group_poisson_rptr),
+                                        c(icc_year_poisson_rptr, lower_year_poisson_rptr, upper_year_poisson_rptr)))
+    glm_poisson_model$effect<-c("ID", "Group", "Year")
+    glm_poisson_model$model<-"GLM poisson"
+    names(glm_poisson_model)<-c("ICC", "lower", "upper", "effect", "model")
+    
+    # add p value
+    
+    glm_poisson_model$p_val<-rptr_poisson_model$P$LRT_P
+    glm_poisson_model$Significant <-gam_model$p_val < 0.051
+    
+    rm("rptr_poisson_model")
+    
+   
+    
+    ############# brms gaussian ######################
+    ############# brms gaussian ######################
+    ############# brms gaussian ######################
+    
+    brms_gaussian <- brm(log10(taxa_i_abundance+1)  ~ 
+                           scale(HoursAfterSunrise)+
+                           scale(Seq_depth_nospikein)+
+                           scale(log10(AgeAtSamplingYears))+
+                           Storage+
+                           Season+
+                           Seq_run+
+                           (1 | Year)+
+                           (1 | IndividID)+
+                           (1 | GroupAtSampling),
+                         data = metadata,
+                         family = "gaussian",
+                         chains = 2,  
+                         iter = 2000)
+    
+    brms_gaussian_icc<-performance::icc(brms_gaussian,by_group = T)
+    
+    icc_id_gaussian_brms<-brms_gaussian_icc$ICC[2]
+    icc_group_gaussian_brms<-brms_gaussian_icc$ICC[1]
+    icc_year_gaussian_brms<-brms_gaussian_icc$ICC[3]
+    
+    
+    ########################
+    ########################
+    ########################
+    
+    glm_gaussian_brms<-data.frame(rbind(c(icc_id_gaussian_brms, NA, NA), 
+                                        c(icc_group_gaussian_brms, NA, NA),
+                                        c(icc_year_gaussian_brms, NA, NA)))
+    
+    glm_gaussian_brms$effect<-c("ID", "Group", "Year")
+    glm_gaussian_brms$model<-"GLM gaussian brms"
+    names(glm_gaussian_brms)<-c("ICC", "lower", "upper", "effect", "model")
+    
+    # add p value
+    
+    glm_gaussian_brms$p_val<-NA
+    glm_gaussian_brms$Significant <-NA
+    
+    rm("brms_gaussian")
+    
+    ######################################
+    ######################################
+    ######################################
+    ######################################
+    
+    
+    results<-rbind(glm_gaussian_brms, glm_poisson_model, gam_model)
+    
+    
+    results$Taxa <- taxanames[i]
+    results$Prevalence <- microbiome::prevalence(taxa1)
+    
+    
+    
+    model_comparison_asv_list[[i]]<-results
+    
+   ## saveRDS(model_comparison_asv_list, "model_comparison_asv_list.RDS")
+
+    
+  }, error=function(e){})
+}
+
+
+icc_asv_df<-do.call(rbind, model_comparison_asv_list)
+#icc_asv_df<-readRDS("ICC_model_comparison.RDS")
+head(icc_asv_df, 10)
+#saveRDS(icc_asv_df, "ICC_model_comparison_22.02.22.RDS")
+
+```
+
+
+```{r}
+
+icc_asv_df<-readRDS("C:/Users/risel/Dropbox/alice risely/Sommer postdoc/Meerkat project/PROJECTS/MeerkatSpikeInData/Analysis updated/2. STABILITY ANALYSIS/Model comparison supercomputer output/ICC_model_comparison_22.02.22.RDS")
+
+icc_asv_df<-do.call(rbind, model_comparison_asv_list)
+#icc_asv_df<-readRDS("ICC_model_comparison.RDS")
+head(icc_asv_df, 10)
+#saveRDS(icc_asv_df, "ICC_model_comparison.RDS")
+
+## add tax info and change asv name to something informative
+
+taxtable<-data.frame(tax_table(meerkat_icc_asv))
+taxtable$Taxa<-row.names(taxtable)
+
+icc_asv_df<-merge(icc_asv_df, taxtable, by = "Taxa", all.x = T)
+
+icc_asv_df$Genus<-ifelse(is.na(icc_asv_df$Genus), icc_asv_df$Family, icc_asv_df$Genus)
+icc_asv_df$Genus<-ifelse(icc_asv_df$Genus == "uncultured", icc_asv_df$Family,icc_asv_df$Genus)
+
+icc_asv_df$ASV<-as.integer(as.factor(icc_asv_df$Taxa))
+icc_asv_df$New_Taxa<-paste(icc_asv_df$Genus, "ASV", icc_asv_df$ASV)
+
+head(icc_asv_df)
+
+
+#### id 
+
+id_comparison<-subset(icc_asv_df, effect == "ID")
+head(id_comparison)
+id_comparison<-id_comparison[,c("Taxa", "ICC", "model")]
+
+icc_comparison_id<-spread(id_comparison, model, ICC)
+
+head(icc_comparison_id)
+
+comp1<-ggplot(icc_comparison_id, aes(y = `GAM gaussian`, x = `GLM poisson`))+
+    geom_abline(col = "red", size = 2, linetype = "dashed")+
+  geom_point(size = 2, alpha = 0.5)+
+  geom_smooth(method = "lm")+
+  theme_clean(base_size = 16)+
+  ggtitle("Gaussian GAMM vs Poisson GLMM")+
+ # annotate("text", x=0.08, y=0.1, label= "x = y", size = 8, col = "red") +
+  theme(plot.background = element_rect(color = "white"))+
+  ylab("ICC (Gaussian GAMM)")+
+  xlab("")+
+ theme(plot.title = element_text(size=14))+
+
+
+ggplot(icc_comparison_id, aes(y = `GAM gaussian`, x = `GLM gaussian brms`))+
+  geom_abline(col = "red", size = 2, linetype = "dashed")+
+  geom_point(size = 2, alpha = 0.5)+
+  geom_smooth(method = "lm")+
+  theme_clean(base_size = 16)+
+  ggtitle("Frequentist vs uninformed Bayesian")+
+ # annotate("text", x=0.07, y=0.06, label= "x = y", size = 8, col = "red") +
+  theme(plot.background = element_rect(color = "white"))+
+  ylab("")+
+  xlab("")+
+ theme(plot.title = element_text(size=14))
+
+################ group
+group_comparison<-subset(icc_asv_df, effect == "Group")
+head(group_comparison)
+group_comparison<-group_comparison[,c("Taxa", "ICC", "model")]
+
+icc_comparison_group<-spread(group_comparison, model, ICC)
+
+head(icc_comparison_group)
+
+comp2<-ggplot(icc_comparison_group, aes(y = `GAM gaussian`, x = `GLM poisson`))+
+    geom_abline(col = "red", size = 2, linetype = "dashed")+
+  geom_point(size = 2, alpha = 0.5)+
+  geom_smooth(method = "lm")+
+  theme_clean(base_size = 16)+
+ # annotate("text", x=0.08, y=0.1, label= "x = y", size = 8, col = "red") +
+  theme(plot.background = element_rect(color = "white"))+
+  ylab("ICC (Gaussian GAMM)")+
+  xlab("")+
+
+ggplot(icc_comparison_group, aes(y = `GAM gaussian`, x = `GLM gaussian brms`))+
+  geom_abline(col = "red", size = 2, linetype = "dashed")+
+  geom_point(size = 2, alpha = 0.5)+
+  geom_smooth(method = "lm")+
+  theme_clean(base_size = 16)+
+ # annotate("text", x=0.07, y=0.06, label= "x = y", size = 8, col = "red") +
+  theme(plot.background = element_rect(color = "white"))+
+  ylab("")+
+  xlab("")
+
+### year
+
+
+year_comparison<-subset(icc_asv_df, effect == "Year")
+head(year_comparison)
+year_comparison<-year_comparison[,c("Taxa", "ICC", "model")]
+
+icc_comparison_year<-spread(year_comparison, model, ICC)
+
+head(icc_comparison_year)
+
+comp3<-ggplot(icc_comparison_year, aes(y = `GAM gaussian`, x = `GLM poisson`))+
+    geom_abline(col = "red", size = 2, linetype = "dashed")+
+  geom_point(size = 2, alpha = 0.5)+
+  geom_smooth(method = "lm")+
+  theme_clean(base_size = 16)+
+ # annotate("text", x=0.08, y=0.1, label= "x = y", size = 8, col = "red") +
+  theme(plot.background = element_rect(color = "white"))+
+  ylab("ICC (Gaussian GAMM)")+
+  xlab("ICC (Poisson GLMM)")+
+
+ggplot(icc_comparison_year, aes(y = `GAM gaussian`, x = `GLM gaussian brms`))+
+  geom_abline(col = "red", size = 2, linetype = "dashed")+
+  geom_point(size = 2, alpha = 0.5)+
+  geom_smooth(method = "lm")+
+  theme_clean(base_size = 16)+
+ # annotate("text", x=0.07, y=0.06, label= "x = y", size = 8, col = "red") +
+  theme(plot.background = element_rect(color = "white"))+
+  ylab("")+
+  xlab("ICC (Gaussian GLMM Bayesian)")
+
+ggarrange(comp1, comp2, comp3, ncol = 1, labels = c("a)", "b)", "c)"), align = "hv")
+
+```
+
+
+## 4. Generate ICC values - ASV level 
+
+```{r}
+ICC_asv_list<-list()
+random_effects_list<-list()
+
+sample_data(meerkat_icc_asv)$Year<-factor(sample_data(meerkat_icc_asv)$Year)
+#str(sample_data(meerkat_icc_asv))
+taxanames<-taxa_names(meerkat_icc_asv)
+
+
+for (i in 1:length(taxanames)){
+  
+   tryCatch({ #catch errors
+  
+  print(i)
+  
+  taxa1<-prune_taxa(taxanames[i], meerkat_icc_asv)
+  # taxa1<-prune_taxa(taxanames[14], meerkat_icc_asv)
+
+
+  sample_data(taxa1)$taxa_i_abundance<-sample_sums(taxa1)
+  metadata<-data.frame(sample_data(taxa1))
+
+  metadata$Seq_depth_nospikein<-as.numeric(scale( metadata$Seq_depth_nospikein))
+  metadata$HoursAfterSunrise<-as.numeric(scale( metadata$HoursAfterSunrise))
+
+  
+  metadata<-metadata %>% arrange(IndividID, SampleDate)
+ # str(metadata)
+  #metadata$Year<-as.factor(lubridate::year(metadata$SampleDate))
+  #metadata$JulianDate<-as.numeric(metadata$SampleDate-min(metadata$SampleDate))
+  
+
+  tax_table(taxa1)
+
+  
+    ############################## models ##############
+  ############################## models ##############
+  ############################## models ##############
+  
+  #str(metadata)
+
+  gammodel_log<- mgcv::bam(log10(taxa_i_abundance+1)~
+                         s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Seq_run+
+                         Season+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+  
+ 
+   summary(gammodel_log)
+   random_df<-gammit::extract_ranef(gammodel_log)
+   random_df$Taxa <-taxanames[i]
+   
+  
+   #gratia::draw(gammodel_log)
+   
+   #plot(gammodel_log)
+  # acf(resid(gammodel_log), lag.max = 1000, main = "ACF")
+   #pacf(resid(gammodel_log), lag.max = 1000, main = "ACF")
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_log, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[6,"Year_adj"]
+upper_year_gam<- gam_boot$rpt[8,"Year_adj"]
+
+
+gam_model<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+
+gam_model$effect<-c("Year", "ID", "Group")
+gam_model$model<-"GAM gaussian"
+names(gam_model)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_model$p_val<-gam_boot$lrt$p_value
+gam_model$Significant <-gam_model$p_val < 0.051
+
+#########
+
+gam_model$Taxa <-taxanames[i]
+gam_model$Prevalence<-  as.numeric(microbiome::prevalence(taxa1))
+  
+ICC_asv_list[[i]]<-gam_model
+random_effects_list[[i]]<- random_df
+
+
+  
+   }, error=function(e){})
+}
+
+icc_asv_df<-do.call(rbind, ICC_asv_list)
+
+#names(random_effects_list)<-taxanames
+ranef_df<-do.call(rbind, random_effects_list)
+#ranef_df<-rbindlist(random_effects_list, idcol = TRUE)
+#names(ranef_df)[1]<-"Taxa"
+
+head(icc_asv_df)
+head(ranef_df, 10)
+
+table(is.na(icc_asv_df$ICC))
+
+```
+
+
+
+
+## 5. Generate ICC values (genus level)
+
+
+```{r}
+ICC_genus_list<-list()
+
+taxanames<-taxa_names(meerkat_icc_genus)
+#taxanames<-taxanames[26:length(taxanames)]
+#tax_table(meerkat_icc_asv)
+
+#microbiome::prevalence(meerkat_icc_asv)
+
+for (i in 1:length(taxanames)){
+  
+   tryCatch({ #catch errors
+  
+  print(i)
+  
+  taxa1<-prune_taxa(taxanames[i], meerkat_icc_genus)
+  # taxa1<-prune_taxa(taxanames[14], meerkat_icc_asv)
+
+  microbiome::prevalence(taxa1)
+  sample_data(taxa1)$taxa_i_abundance<-sample_sums(taxa1)
+  metadata<-data.frame(sample_data(taxa1))
+  #metadata<-metadata[,c(variables_all, "taxa_i_abundance", "Year")]
+  
+  metadata$Seq_depth_nospikein<-as.numeric(scale( metadata$Seq_depth_nospikein))
+  metadata$HoursAfterSunrise<-as.numeric(scale( metadata$HoursAfterSunrise))
+
+  
+  metadata<-metadata %>% arrange(IndividID, SampleDate)
+  head(metadata)
+  metadata$Year<-as.factor(lubridate::year(metadata$SampleDate))
+  metadata$JulianDate<-as.numeric(metadata$SampleDate-min(metadata$SampleDate))
+  
+
+  tax_table(taxa1)
+############################## models ##############
+  ############################## models ##############
+  ############################## models ##############
+  ############################## models ##############
+  
+  #str(metadata)
+
+   gammodel_log<- mgcv::bam(log10(taxa_i_abundance+1)~
+                          s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Seq_run+
+                           Season+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+  
+ 
+   print(summary(gammodel_log))
+   #gratia::draw(gammodel_log)
+   
+   #plot(gammodel_log)
+  # acf(resid(gammodel_log), lag.max = 1000, main = "ACF")
+   #pacf(resid(gammodel_log), lag.max = 1000, main = "ACF")
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_log, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[6,"Year_adj"]
+upper_year_gam<- gam_boot$rpt[8,"Year_adj"]
+
+
+gam_model<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+
+gam_model$effect<-c("Year", "ID", "Group")
+gam_model$model<-"GAM gaussian"
+names(gam_model)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_model$p_val<-gam_boot$lrt$p_value
+gam_model$Significant <-gam_model$p_val < 0.051
+
+#########
+
+gam_model$Taxa <-taxanames[i]
+gam_model$Prevalence<-  as.numeric(microbiome::prevalence(taxa1))
+  
+ICC_genus_list[[i]]<-gam_model
+
+  
+   }, error=function(e){})
+}
+
+icc_genus_df<-do.call(rbind, ICC_genus_list)
+
+
+```
+
+## 6. Plot ICC
+
+```{r}
+
+taxtable<-data.frame(tax_table(meerkat_icc_asv))
+taxtable$Taxa<-row.names(taxtable)
+head(taxtable)
+head(icc_asv_df)
+
+icc_asv_df<-merge(icc_asv_df, taxtable, by = "Taxa", all.x = T)
+
+icc_asv_df$Genus<-ifelse(is.na(icc_asv_df$Genus), icc_asv_df$Family, icc_asv_df$Genus)
+icc_asv_df$Genus<-ifelse(icc_asv_df$Genus == "uncultured", icc_asv_df$Family,icc_asv_df$Genus)
+
+icc_asv_df$ASV<-as.integer(as.factor(icc_asv_df$Taxa))
+icc_asv_df$New_Taxa<-paste(icc_asv_df$Genus, "ASV", icc_asv_df$ASV)
+
+#icc_asv_df$icc_significant<-icc_asv_df$lower > 0.001
+#head(icc_asv_df)
+
+pal <- wesanderson::wes_palette("Zissou1", 100, type = "continuous")
+
+id_order<-subset(icc_asv_df, effect=="ID")
+id_order <- id_order %>%arrange(-ICC)
+id_order<-as.character(id_order$New_Taxa)
+
+icc_asv_df$New_Taxa<- factor(icc_asv_df$New_Taxa, levels = rev(id_order))
+
+icc_asv_df$effect<-factor(icc_asv_df$effect, levels = c("ID", "Group", "Year"))
+
+icc_asv_df %>% group_by(effect) %>% summarize(mean = mean(ICC), sd = sd(ICC), max = max(ICC))
+
+
+levels(icc_asv_df$effect)<-c("ID", "Social group", "Year")
+
+ggplot(icc_asv_df, aes(y = New_Taxa, x = ICC))+
+  geom_errorbarh(aes(xmin = lower, xmax = upper, col = ICC, linetype = Significant), height = 0, size = 1)+
+   geom_errorbarh(aes(xmin = lower, xmax = upper, alpha= Significant), height = 0, size = 1, col = "grey")+
+   geom_point(aes(fill= ICC), pch = 21, size = 2)+
+   geom_point(aes(alpha= Significant), size = 2, col = "grey")+
+  scale_alpha_discrete(range = c(1,0))+
+  scale_shape_manual(values = c(17,16))+
+  scale_size(range = c(2,6))+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  theme_clean(base_size = 12)+
+  ylab("ASV")+
+  theme(plot.title = element_text(hjust=-1))+
+  theme(plot.margin = margin(0.2,0.2,0,0.2, "cm"))+
+  xlab("ICC")+
+  scale_color_gradientn(colours = pal)+
+  scale_fill_gradientn(colours = pal)+
+  scale_linetype_manual(values = c("dotted", "solid"))+
+  #labs(size = "Relative \nabundance")+
+  labs(linetype = "Significant")+
+  labs(fill = "ICC")+
+  labs(colour = "ICC")+
+  facet_wrap(~effect)+
+ theme(axis.text.y=element_text( size=8))+
+  coord_cartesian(xlim = c(0,0.4))+ #CHANGE
+   theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"))
+
+
+ggsave("FIGURES/FigS2.jpeg", width = 10, height = 11, units = c("in"))
+
+## stats 
+
+table(subset(icc_asv_df, effect == "ID")$Significant)
+summary(subset(icc_asv_df, effect == "ID")$ICC)
+summary(subset(icc_asv_df, effect == "ID" & Significant == T)$ICC)
+sd(subset(icc_asv_df, effect == "ID" & Significant == T)$ICC)
+
+subset(icc_asv_df, effect == "ID"& ICC>0.1)
+
+df<-subset(icc_asv_df %>% group_by(effect, Significant) %>% summarize(sig = n()), Significant == T)
+
+df$percent<-df$sig/121
+
+icc_asv_df %>% group_by(effect, Significant) %>% summarize(mean = mean(ICC), sd = sd(ICC))
+
+### correlations
+
+head(icc_asv_df)
+icc_asv_wide<-icc_asv_df[,c("effect", "ICC", "Taxa", "Genus")]
+icc_asv_wide<-spread(icc_asv_wide, effect, ICC)
+
+head(icc_asv_wide)
+
+genus_freq<-data.frame(table(icc_asv_df$Genus))
+genus_freq<- genus_freq %>% arrange(-Freq)
+head(genus_freq)
+top_genera<-genus_freq$Var1[1:10]
+
+icc_asv_wide$Genus_plot<-ifelse(icc_asv_wide$Genus %in% top_genera, icc_asv_wide$Genus, "Other")
+
+cor1<-ggplot(icc_asv_wide, aes(y = ID, x = Year))+geom_point(aes(col = Genus_plot), size = 2)+scale_color_brewer(palette = "Paired")+
+  theme_clean(base_size = 14)+
+  geom_smooth(method = "lm", se = F, col = "black", linetype = "dashed") +
+  theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey"))+
+  theme(plot.background = element_rect(color = "white"))
+
+cor2<-ggplot(icc_asv_wide, aes(y = ID, x = `Social group`))+geom_point(aes(col = Genus_plot), size = 2)+scale_color_brewer(palette = "Paired")+
+  theme_clean(base_size = 14)+
+  geom_smooth(method = "lm", se = F, col = "black", linetype = "dashed")+
+  theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey"))+
+  theme(plot.background = element_rect(color = "white"))
+
+cor3<-ggplot(icc_asv_wide, aes(x = Year, y = `Social group`))+geom_point(aes(col = Genus_plot), size = 2)+scale_color_brewer(palette = "Paired")+
+  theme_clean(base_size = 14)+
+  geom_smooth(method = "lm", se = F, col = "black", linetype = "dashed")+
+  theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey"))+
+  theme(plot.background = element_rect(color = "white"))
+
+ggarrange(cor2, cor1, cor3, ncol = 3, common.legend = T, legend = "bottom", labels = c("a)", "b)", "c)"))
+
+cor.test(icc_asv_wide$ID, icc_asv_wide$`Social group`)
+cor.test(icc_asv_wide$ID, icc_asv_wide$Year)
+cor.test(icc_asv_wide$`Social group`, icc_asv_wide$Year)
+
+
+
+
+### Genus level ########
+### Genus level ########
+### Genus level ########
+### Genus level ########
+
+taxtable<-data.frame(tax_table(meerkat_icc_genus))
+taxtable$Taxa<-row.names(taxtable)
+head(taxtable)
+head(icc_genus_df)
+
+icc_genus_df<-merge(icc_genus_df, taxtable, by = "Taxa", all.x = T)
+
+icc_genus_df$Genus<-ifelse(is.na(icc_genus_df$Genus), icc_genus_df$Family, icc_genus_df$Genus)
+icc_genus_df$Genus<-ifelse(icc_genus_df$Genus == "uncultured", icc_genus_df$Family,icc_genus_df$Genus)
+
+icc_genus_df$ASV<-as.integer(as.factor(icc_genus_df$Taxa))
+
+
+#icc_asv_df$icc_significant<-icc_asv_df$lower > 0.001
+#head(icc_asv_df)
+
+pal <- wesanderson::wes_palette("Zissou1", 100, type = "continuous")
+
+id_order<-subset(icc_genus_df, effect=="ID")
+id_order <- id_order %>%arrange(-ICC)
+id_order <-id_order$Genus
+
+icc_genus_df$Genus<-factor(icc_genus_df$Genus, levels = rev(id_order))
+
+icc_genus_df$effect<-factor(icc_genus_df$effect, levels = c("ID", "Group", "Year"))
+
+icc_genus_df %>% group_by(effect) %>% summarize(mean = mean(ICC), sd = sd(ICC), max = max(ICC))
+
+
+
+ggplot(icc_genus_df, aes(y = Genus, x = ICC))+
+  geom_errorbarh(aes(xmin = lower, xmax = upper, col = ICC, linetype = Significant), height = 0, size = 1)+
+  geom_errorbarh(aes(xmin = lower, xmax = upper, alpha= Significant), height = 0, size = 1, col = "grey")+
+   geom_point(aes(fill= ICC), pch = 21, size = 2)+
+   geom_point(aes(alpha= Significant), size = 2, col = "grey")+
+  scale_alpha_discrete(range = c(1,0))+
+  scale_shape_manual(values = c(17,16))+
+  scale_size(range = c(2,6))+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  theme_clean(base_size = 14)+
+  ylab("ASV")+
+  theme(plot.title = element_text(hjust=-1))+
+  theme(plot.margin = margin(0.2,0.2,0,0.2, "cm"))+
+  xlab("Repeatability")+
+  scale_color_gradientn(colours = pal)+
+  scale_fill_gradientn(colours = pal)+
+  scale_linetype_manual(values = c("dotted", "solid"))+
+  #labs(size = "Relative \nabundance")+
+  labs(linetype = "Significant")+
+  labs(fill = "ICC")+
+  labs(colour = "ICC")+
+  facet_wrap(~effect)+
+ theme(axis.text.y=element_text( size=10))+
+  coord_cartesian(xlim = c(0,0.3))+
+   theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"))
+
+paste("Annual variation had the strongest effects on taxa abundances (", 
+      
+     round(table(subset(icc_genus_df, effect == "Year")$Significant)[[2]]/(table(subset(icc_genus_df, effect == "Year")$Significant)[[2]]+ table(subset(icc_genus_df, effect == "Year")$Significant)[[1]]), 2),"significant",";",
+      
+      "mean ICC = ", round(mean(subset(icc_genus_df, effect == "Year")$ICC), 3),
+      
+        ") with social group membership (" , 
+            
+      round(table(subset(icc_genus_df, effect == "Group")$Significant)[[2]]/(table(subset(icc_genus_df, effect == "Group")$Significant)[[2]]+ table(subset(icc_genus_df, effect == "Group")$Significant)[[1]]), 3),"significant",";",
+      
+      "mean ICC = ", round(mean(subset(icc_genus_df, effect == "Group")$ICC), 3),
+      
+       ") and identity (", 
+      
+            round(table(subset(icc_genus_df, effect == "ID")$Significant)[[2]]/(table(subset(icc_genus_df, effect == "ID")$Significant)[[2]]+ table(subset(icc_genus_df, effect == "ID")$Significant)[[1]]), 3),"significant",";",
+      
+      "mean ICC = ", round(mean(subset(icc_genus_df, effect == "ID")$ICC), 3),
+      
+     ") having weaker effects (Fig. 1).") 
+
+table(subset(icc_genus_df, effect == "ID")$Significant)
+summary(subset(icc_genus_df, effect == "ID")$ICC)
+summary(subset(icc_genus_df, effect == "ID" & Significant == T)$ICC)
+sd(subset(icc_genus_df, effect == "ID" & Significant == T)$ICC)
+
+
+### correlations
+
+head(icc_genus_df)
+icc_genus_wide<-icc_genus_df[,c("effect", "ICC", "Taxa", "Genus")]
+icc_genus_wide<-spread(icc_genus_wide, effect, ICC)
+
+head(icc_genus_wide)
+
+genus_freq<-data.frame(table(icc_genus_df$Genus))
+genus_freq<- genus_freq %>% arrange(-Freq)
+head(genus_freq)
+top_genera<-genus_freq$Var1[1:10]
+
+icc_genus_wide$Genus_plot<-ifelse(icc_genus_wide$Genus %in% top_genera, icc_genus_wide$Genus, "Other")
+
+cor1<-ggplot(icc_genus_wide, aes(y = ID, x = Year))+geom_point(aes(col = Genus_plot), size = 2)+scale_color_brewer(palette = "Paired")+
+  theme_clean(base_size = 14)+
+  geom_smooth(method = "lm", se = F, col = "black", linetype = "dashed") +
+  theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey"))+
+  theme(plot.background = element_rect(color = "white"))
+
+cor2<-ggplot(icc_genus_wide, aes(y = ID, x = `Social group`))+geom_point(aes(col = Genus_plot), size = 2)+scale_color_brewer(palette = "Paired")+
+  theme_clean(base_size = 14)+
+  geom_smooth(method = "lm", se = F, col = "black", linetype = "dashed")+
+  theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey"))+
+  theme(plot.background = element_rect(color = "white"))
+
+cor3<-ggplot(icc_genus_wide, aes(x = Year, y = `Social group`))+geom_point(aes(col = Genus_plot), size = 2)+scale_color_brewer(palette = "Paired")+
+  theme_clean(base_size = 14)+
+  geom_smooth(method = "lm", se = F, col = "black", linetype = "dashed")+
+  theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey"))+
+  theme(plot.background = element_rect(color = "white"))
+
+ggarrange(cor2, cor1, cor3, ncol = 3, common.legend = T, legend = "bottom")
+
+```
+
+## 7.  Random effects estimates
+
+```{r}
+
+head(ranef_df)
+
+ggplot(subset(ranef_df, group_var == "Year"), aes(x = group, y = value))+geom_boxplot()+geom_jitter(width = 0.2)+geom_line(aes(group = Taxa), alpha = 0.3)
+
+## rainfall
+
+daily_rainfall<-read.csv("C:/Users/risel/Dropbox/Sommer postdoc/Meerkat project/PROJECTS/MEERKAT DATA/Weather data/SA Weather service data/formatted_daily_rainfall_VanZylsrus_1997_2019.csv")[-1]
+
+daily_rainfall$Date<-as.Date(daily_rainfall$Date, "%Y-%m-%d")
+
+head(daily_rainfall)
+
+daily_rainfall$Month<-month(daily_rainfall$Date)
+
+mean_rainfall<-daily_rainfall %>% group_by(Month) %>% summarise(mean = sum(Rainfall.mm.))
+
+ggplot(mean_rainfall, aes(x = Month, y = mean))+geom_bar(stat="identity")
+
+daily_rainfall$DateHydro<-daily_rainfall$Date-91
+
+daily_rainfall$HydroYear<-lubridate::year(daily_rainfall$DateHydro)
+
+yearly_rainfall<-daily_rainfall %>% group_by(HydroYear) %>% summarize(yearly_rainfall = mean(Rainfall.mm.))
+
+ggplot(yearly_rainfall, aes(x = HydroYear, y = yearly_rainfall))+geom_bar(stat = "identity")+
+  scale_x_continuous(breaks = seq(1997,2020,1))
+
+#### random effects
+
+year_estimates<-subset(ranef_df, group_var == "Year")
+
+year_summary<-year_estimates %>% group_by(group) %>% summarise(mean_value = sum(value))
+
+year_summary<-merge(year_summary, yearly_rainfall, by.x = "group", by.y = "HydroYear")
+
+ggplot(year_summary, aes(y = mean_value, x = yearly_rainfall))+
+  geom_point(size = 3)+
+  geom_smooth(method = "lm")+
+  theme_clean()
+  
+
+## look at taxa with highest yearly variation
+
+head(icc_asv_df)
+
+year_icc_df<-subset(icc_asv_df, effect == "Year")
+summary(year_icc_df$ICC)
+
+subset(year_icc_df, ICC > 0.2)
+
+### subset
+
+taxa1<-subset(year_estimates, Taxa == "1b85e321acab188aae7a2c36613f2371")
+
+p1<-ggplot(taxa1, aes(x = group, y = value, group = 0))+
+  geom_path(col = "blue", size = 1)+
+  geom_point(size = 4, pch = 21, fill = "grey")+
+  geom_errorbar(aes(ymin = lower_2.5, ymax = upper_97.5), width = 0, col = "grey")+
+  theme_clean(base_size = 16)+
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+  ylab("Effect size")+
+  xlab("")
+
+taxa2<-subset(year_estimates, Taxa == "e6f9517e6fe062332b540e649f530891")
+
+p2<-ggplot(taxa2, aes(x = group, y = value, group = 0))+
+  geom_path(col = "blue", size = 1)+
+  geom_point(size = 4, pch = 21, fill = "grey")+
+  geom_errorbar(aes(ymin = lower_2.5, ymax = upper_97.5), width = 0, col = "grey")+
+  theme_clean(base_size = 16)+
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+  ylab("Effect size")+
+  xlab("")
+
+
+
+
+ggarrange(p1, p2)
+
+## is this something to do with total abundance?
+
+metadata_year<-data.frame(sample_data(meerkat_icc_asv))
+
+ggplot(metadata_year, aes(x = Year, y = AgeAtSamplingYears))+geom_boxplot()+geom_jitter(width = 0.2, alpha = 0.5)
+
+
+ggplot(metadata_year, aes(x = Year, y = log10(TotalAbundance)))+geom_boxplot()+geom_jitter(width = 0.2, alpha = 0.5)
+
+ggplot(metadata_year, aes(x = Year, y = log10(sum_rainfall_month+1)))+geom_boxplot()+geom_jitter(width = 0.2, alpha = 0.5)
+
+
+```
+
+
+## 8. Alpha diversity
+
+```{r}
+meerkat_diversity_ps<-subset_samples(meerkat_filtered, SampleCount >3)
+
+group_count<-data.frame(table(sample_data(meerkat_diversity_ps)$GroupAtSampling))
+
+group_count<-group_count %>% arrange(-Freq)
+
+groups_to_keep<-as.character(subset(group_count, Freq >5)$Var1)
+
+meerkat_diversity_ps<-subset_samples(meerkat_diversity_ps, GroupAtSampling %in% groups_to_keep)
+meerkat_diversity_ps
+
+sum(sample_sums(meerkat_diversity_ps))
+sum(sample_sums(meerkat_icc_genus))/sum(sample_sums(meerkat_diversity_ps))
+sum(sample_sums(meerkat_icc_asv))/sum(sample_sums(meerkat_diversity_ps))
+
+alpha_diversity_df<-phyloseq::estimate_richness(meerkat_diversity_ps, measures=c("Observed", "Shannon"))
+
+alpha_diversity_df$PD<- metagMisc::phyloseq_phylo_div(meerkat_diversity_ps, measures = "PD")$PD
+
+head(alpha_diversity_df)
+
+hist(alpha_diversity_df$Observed)
+hist(alpha_diversity_df$Shannon)
+hist(alpha_diversity_df$PD)
+
+metadata_alpha<-data.frame(sample_data(meerkat_diversity_ps))
+metadata_alpha<-merge(metadata_alpha, alpha_diversity_df, by = 0)
+
+str(metadata_alpha)
+
+metadata_alpha$Year<-as.factor(metadata_alpha$Year)
+
+######## observed
+
+gammodel_observed<- mgcv::bam(scale(Observed)~
+                        s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Season+
+                         Seq_run+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata_alpha,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+
+summary(gammodel_observed)
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_observed, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[6,"Year_adj"]
+upper_year_gam<- gam_boot$rpt[8,"Year_adj"]
+
+gam_obs<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+gam_obs$effect<-c("Year", "ID", "Group")
+gam_obs$model<-"Observed"
+names(gam_obs)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_obs$p_val<-gam_boot$lrt$p_value
+gam_obs$Significant <-gam_obs$p_val < 0.051
+
+### shannon
+
+gammodel_shannon<- mgcv::bam(scale(Shannon)~
+                         s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Season+
+                         Seq_run+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata_alpha,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+
+summary(gammodel_shannon)
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_shannon, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[6,"Year_adj"]
+upper_year_gam<- gam_boot$rpt[8,"Year_adj"]
+
+gam_shannon<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+gam_shannon$effect<-c("Year", "ID", "Group")
+gam_shannon$model<-"Shannon"
+names(gam_shannon)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_shannon$p_val<-gam_boot$lrt$p_value
+gam_shannon$Significant <-gam_shannon$p_val < 0.051
+
+gam_shannon
+
+### Faiths PD
+
+
+gammodel_PD<- mgcv::bam(scale(PD)~
+                          s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Season+
+                         Seq_run+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata_alpha,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+
+summary(gammodel_PD)
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_PD, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[7,"Year_adj"] # changed stat here because the other CIs didn't work
+upper_year_gam<- gam_boot$rpt[9,"Year_adj"] # changed stat here because the other CIs didn't work
+
+gam_pd<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+gam_pd$effect<-c("Year", "ID", "Group")
+gam_pd$model<-"PD"
+names(gam_pd)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_pd$p_val<-gam_boot$lrt$p_value
+gam_pd$Significant <-gam_pd$p_val < 0.051
+
+gam_pd
+
+alpha_icc_df<-rbind(gam_obs, gam_shannon, gam_pd)
+
+ggplot(alpha_icc_df, aes(y = ICC, x = effect, col = model))+
+  geom_point(size = 2)+
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0)+
+  facet_wrap(~model)
+
+```
+
+## 9. Beta diversity
+
+```{r}
+
+
+meerkat_beta<-microbiome::core(meerkat_diversity_ps, detection = 1000, prevalence = 0)
+
+paste("This filtering step removed", 1-round(sum(sample_sums(meerkat_beta))/sum(sample_sums(meerkat_diversity_ps)), 3), "% of reads")
+
+ord_wunifrac_mds<-ordinate(meerkat_beta, "MDS", "wunifrac")
+ord_unifrac_mds<-ordinate(meerkat_beta, "MDS", "unifrac")
+ord_bray_mds<-ordinate(meerkat_beta, "MDS", "bray")
+
+dist_wunifrac<-distance(meerkat_beta, method="wunifrac")
+dist_unifrac<-distance(meerkat_beta, method="unifrac")
+dist_bray<-distance(meerkat_beta, method="bray")
+
+#################
+
+
+sample_data(meerkat_beta)$MDS1_WU<-data.frame(ord_wunifrac_mds$vectors)$Axis.1
+sample_data(meerkat_beta)$MDS2_WU<-data.frame(ord_wunifrac_mds$vectors)$Axis.2
+
+
+## unweighted unifrac
+
+sample_data(meerkat_beta)$MDS1_UU<-data.frame(ord_unifrac_mds$vectors)$Axis.1
+sample_data(meerkat_beta)$MDS2_UU<-data.frame(ord_unifrac_mds$vectors)$Axis.2
+
+# bray
+
+sample_data(meerkat_beta)$MDS1_BC<-data.frame(ord_bray_mds$vectors)$Axis.1
+sample_data(meerkat_beta)$MDS2_BC<-data.frame(ord_bray_mds$vectors)$Axis.2
+
+### convert to dataframe 
+
+metadata_beta<-data.frame(sample_data(meerkat_beta))
+
+metadata_beta$Year<-factor(metadata_beta$Year)
+
+###
+
+gammodel_WU1<- mgcv::bam(MDS1_WU~
+                          s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Season+
+                         Seq_run+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata_beta,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+
+summary(gammodel_WU1)
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_WU1, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[7,"Year_adj"] # changed stat here because the other CIs didn't work
+upper_year_gam<- gam_boot$rpt[9,"Year_adj"] # changed stat here because the other CIs didn't work
+
+gam_WU1<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+gam_WU1$effect<-c("Year", "ID", "Group")
+gam_WU1$model<-"W_Unifrac_1"
+names(gam_WU1)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_WU1$p_val<-gam_boot$lrt$p_value
+gam_WU1$Significant <-gam_WU1$p_val < 0.0511
+
+gam_WU1
+
+#######################
+
+gammodel_UU1<- mgcv::bam(MDS1_UU~
+                         s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Season+
+                         Seq_run+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata_beta,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+
+summary(gammodel_UU1)
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_UU1, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[7,"Year_adj"] # changed stat here because the other CIs didn't work
+upper_year_gam<- gam_boot$rpt[9,"Year_adj"] # changed stat here because the other CIs didn't work
+
+gam_UU1<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+gam_UU1$effect<-c("Year", "ID", "Group")
+gam_UU1$model<-"U_Unifrac_1"
+names(gam_UU1)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_UU1$p_val<-gam_boot$lrt$p_value
+gam_UU1$Significant <-gam_UU1$p_val < 0.051
+
+gam_UU1
+
+
+#### bray
+
+gammodel_BC1<- mgcv::bam(MDS1_BC~
+                          s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Season+
+                         Seq_run+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata_beta,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+
+summary(gammodel_BC1)
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_BC1, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[7,"Year_adj"] # changed stat here because the other CIs didn't work
+upper_year_gam<- gam_boot$rpt[9,"Year_adj"] # changed stat here because the other CIs didn't work
+
+gam_BC1<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+gam_BC1$effect<-c("Year", "ID", "Group")
+gam_BC1$model<-"BrayCurtis_1"
+names(gam_BC1)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_BC1$p_val<-gam_boot$lrt$p_value
+gam_BC1$Significant <-gam_BC1$p_val < 0.051
+
+gam_BC1
+
+beta_icc_df<-rbind(gam_WU1, gam_UU1, gam_BC1)
+
+ggplot(beta_icc_df, aes(y = ICC, x = effect, col = model))+
+  geom_point(size = 2)+
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0)+
+  facet_wrap(~model)
+
+
+################################## permanova 
+
+
+metadata<-data.frame(sample_data(meerkat_icc_asv))
+dim(metadata)
+
+adonis2(dist_wunifrac~
+    Storage+
+    Seq_run+
+    HoursTilFrozen+
+    Seq_depth_nospikein + 
+    month+
+    AgeAtSamplingYears+
+    HoursAfterSunrise+
+      GroupAtSampling+
+      IndividID, 
+  data = metadata)
+
+
+```
+
+## 10. Bacterial load
+
+```{r}
+
+metadata_load<-data.frame(sample_data(meerkat_diversity_ps))
+str(metadata_load)
+metadata_load$Year<-factor(metadata_load$Year)
+
+
+gammodel_load<- mgcv::bam(scale(TotalAbundance)~
+                          s(scale(HoursAfterSunrise), bs = "cr")+
+                         s(scale(Seq_depth_nospikein), bs = "cr")+
+                         s(scale(log10(AgeAtSamplingYears)), bs = "cr")+
+                         Storage+
+                         Season+
+                         Seq_run+
+                         s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=metadata_load,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+
+summary(gammodel_load)
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_load, nboot = 10, nperm = 0)
+
+
+# ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[7,"Year_adj"] # changed stat here because the other CIs didn't work
+upper_year_gam<- gam_boot$rpt[9,"Year_adj"] # changed stat here because the other CIs didn't work
+
+gam_load<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+gam_load$effect<-c("Year", "ID", "Group")
+gam_load$model<-"Bacterial load"
+names(gam_load)<-c("ICC", "lower", "upper", "effect", "model")
+
+# add p value
+
+gam_load$p_val<-gam_boot$lrt$p_value
+gam_load$Significant <-gam_load$p_val < 0.051
+
+gam_load
+
+```
+
+## 11. Diversity plot
+
+```{r}
+
+div_icc_df<-rbind(alpha_icc_df, beta_icc_df, gam_load)
+
+unique(div_icc_df$model)
+
+div_icc_df$model<-factor(div_icc_df$model, levels = rev(c("Bacterial load", "Observed", "Shannon", "PD", "W_Unifrac_1", "U_Unifrac_1", "BrayCurtis_1")))
+
+str(div_icc_df)
+div_icc_df$Significant<-factor(div_icc_df$Significant)
+
+div_icc_df$effect<-factor(div_icc_df$effect, levels = rev(c("Year", "Group", "ID")))
+
+
+ggplot(div_icc_df, aes(x = ICC, y = model, group = effect))+
+  geom_errorbarh(aes(xmin = lower, xmax = upper, col = ICC, linetype = Significant), height = 0, size = 1)+
+   geom_errorbarh(aes(xmin = lower, xmax = upper, alpha= Significant), height = 0, size = 1, col = "grey")+
+   geom_point(aes(fill= ICC), pch = 21, size = 4)+
+  geom_point(aes(alpha= Significant), size = 4, col = "grey")+
+  facet_wrap(~effect, ncol = 1)+
+     scale_alpha_discrete(range = c(1,0))+
+     geom_vline(xintercept = 0, linetype = "dashed")+
+     theme_clean(base_size = 16)+
+    scale_color_gradientn(colours = pal)+
+  scale_fill_gradientn(colours = pal)+
+   scale_linetype_manual(values = c("dotted", "solid"))+
+  ylab("")+
+  theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"))
+```
+
+
+## 12. Figure 1
+
+```{r}
+
+length(unique(icc_genus_df$Taxa))
+
+head(icc_genus_df)
+levels(icc_genus_df$effect)<-c("ID", "Social group", "Year")
+
+fig1a<-ggplot(icc_genus_df, aes(y = Genus, x = ICC))+
+  geom_errorbarh(aes(xmin = lower, xmax = upper, col = ICC, linetype = Significant), height = 0, size = 1)+
+  geom_errorbarh(aes(xmin = lower, xmax = upper, alpha= Significant), height = 0, size = 1, col = "grey")+
+   geom_point(aes(fill= ICC), pch = 21, size = 2)+
+   geom_point(aes(alpha= Significant), size = 2, col = "grey")+
+  scale_alpha_discrete(range = c(1,0))+
+  scale_shape_manual(values = c(17,16))+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+   scale_color_gradientn(colours = pal)+
+  scale_fill_gradientn(colours = pal)+
+  scale_linetype_manual(values = c("dotted", "solid"))+
+    facet_wrap(~effect)+
+  
+  theme_clean(base_size = 12)+
+  theme(plot.title = element_text(hjust=-1))+
+  theme(axis.title= element_blank(),
+        axis.text.x = element_blank())+
+  labs(linetype = "Significant")+
+  labs(fill = "ICC")+
+  labs(colour = "ICC")+
+
+ theme(axis.text.y=element_text( size=10))+
+  coord_cartesian(xlim = c(0,0.3))+
+   theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey"))+
+  theme(plot.background = element_rect(color = "white"))
+
+fig1b<-ggplot(div_icc_df, aes(x = ICC, y = model, group = effect))+
+  geom_errorbarh(aes(xmin = lower, xmax = upper, col = ICC, linetype = Significant), height = 0, size = 1)+
+   geom_errorbarh(aes(xmin = lower, xmax = upper, alpha= Significant), height = 0, size = 1, col = "grey")+
+   geom_point(aes(fill= ICC), pch = 21, size = 2)+
+  geom_point(aes(alpha= Significant), size = 2, col = "grey")+
+  facet_wrap(~effect, ncol = 3)+
+     scale_alpha_discrete(range = c(1,0))+
+     geom_vline(xintercept = 0, linetype = "dashed")+
+     theme_clean(base_size = 12)+
+    scale_color_gradientn(colours = pal)+
+  scale_fill_gradientn(colours = pal)+
+   scale_linetype_manual(values = c("dotted", "solid"))+
+  ylab("")+
+    coord_cartesian(xlim = c(0,0.3))+
+  theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "grey"))+
+  theme(plot.background = element_rect(color = "white"))+
+  theme(
+  strip.background = element_blank(),
+  strip.text.x = element_blank())
+
+ggarrange(fig1a, fig1b, ncol = 1, common.legend = T, legend = "right", heights = c(2.5,1), align = "v", labels =c("a)", "b)"))
+
+```
+
+
+
+## 13a. Phylosignal (ID)
+
+```{r}
+
+meerkat_icc_asv
+
+## make new tree
+
+taxtable<-data.frame(tax_table(meerkat_icc_asv))
+head(taxtable)
+str(taxtable)
+taxtable$Kingdom<-factor(taxtable$Kingdom)
+taxtable$Phylum<-factor(taxtable$Phylum)
+taxtable$Order<-factor(taxtable$Order)
+taxtable$Class<-factor(taxtable$Class)
+taxtable$Family<-factor(taxtable$Family)
+taxtable$Genus<-factor(taxtable$Genus)
+
+head(icc_asv_df)
+new_names_df<-icc_asv_df[,c("Taxa", "New_Taxa")]
+new_names_df<-unique(new_names_df)
+dim(new_names_df)
+row.names(new_names_df)<-new_names_df$Taxa
+
+taxtable<-merge(taxtable, new_names_df, by = 0)
+str(taxtable)
+taxtable<-taxtable[,c(2:7,10)]
+table(is.na(taxtable$New_Taxa))
+
+taxtable<-taxtable %>% arrange(Phylum, Class, Order, Family, Genus, New_Taxa)
+head(taxtable)
+dim(taxtable)
+
+taxtable$Genus<-ifelse(is.na(taxtable$Genus), paste("Unknown", taxtable$Family, sep = " "), taxtable$Genus)
+taxtable$Genus<-factor(taxtable$Genus)
+table(is.na(taxtable$Genus))
+str(taxtable)
+
+frm <- ~Phylum/Class/Order/Family/Genus/New_Taxa
+tree <- as.phylo(frm, data = taxtable, collapse=FALSE)
+length(tree$tip.label)
+
+tree$edge.length <- rep(1, nrow(tree$edge))
+plot(tree, show.node.label=TRUE,tree.ladderize = F)
+tree$tip.label[1:5]
+
+
+ggtree(tree) + geom_tiplab() 
+
+icc_asv_phylosignal<-subset(icc_asv_df, effect == "ID")
+summary(icc_asv_phylosignal$ICC)
+head(icc_asv_phylosignal)
+
+row.names(icc_asv_phylosignal)<-icc_asv_phylosignal$New_Taxa
+icc_asv_phylosignal<-icc_asv_phylosignal[tree$tip.label,]
+
+icc_asv_phylosignal2<-data.frame(icc_asv_phylosignal[,c(2)])
+head(icc_asv_phylosignal2)
+row.names(icc_asv_phylosignal2)<-row.names(icc_asv_phylosignal)
+head(icc_asv_phylosignal2)
+names(icc_asv_phylosignal2)<-"ICC"
+table(is.na(icc_asv_phylosignal2$ICC))
+str(icc_asv_phylosignal2)
+dim(icc_asv_phylosignal2)
+#icc_asv_phylosignal2<-icc_asv_phylosignal2[tree$tip.label,]
+
+
+str(tree)
+tree$tip.label[1:5]
+head(icc_asv_phylosignal2)
+tree<-ape::collapse.singles(tree)
+
+p4d <- phylobase::phylo4d(tree,icc_asv_phylosignal2)
+phyloSignal(p4d, method = "all")
+
+barplot.phylo4d(p4d, tree.type = "phylo",tree.ladderize = F, bar.lwd = 3, show.tip = T, center = T, scale = F, trait.bg.col = "white", grid.col = "grey", tree.open.crown = 0, tip.adj = 1)
+
+scaled_icc<-as.numeric(scale(icc_asv_phylosignal2$ICC))
+colors<-ifelse(scaled_icc <=0, "black", "red")
+
+barplot.phylo4d(p4d, tree.type = "phylo",tree.ladderize = T, bar.lwd = 4, show.tip = T, center = T, scale = F,  grid.col = "grey", bar.col = colors, tip.col = colors, tip.cex = 0.7)
+
+# save image as jpeg
+# 11 x 9
+#ggsave("FIGURES/Fig3a.pdf", width = 14, height = 10, units = c("in"))
+
+
+```
+
+## 13b. Phylosignal: Social group 
+
+```{r}
+icc_asv_phylosignal<-subset(icc_asv_df, effect == "Social group")
+summary(icc_asv_phylosignal$ICC)
+head(icc_asv_phylosignal)
+#row.names(icc_asv_phylosignal)<-icc_asv_phylosignal$Taxa
+#icc_asv_phylosignal<-icc_asv_phylosignal[tree$tip.label,]
+#row.names(icc_asv_phylosignal)<-icc_asv_phylosignal$New_Taxa
+#tree$tip.label<-as.character(icc_asv_phylosignal$New_Taxa)
+
+row.names(icc_asv_phylosignal)<-icc_asv_phylosignal$New_Taxa
+icc_asv_phylosignal<-icc_asv_phylosignal[tree$tip.label,]
+
+icc_asv_phylosignal2<-data.frame(icc_asv_phylosignal[,c(2)])
+head(icc_asv_phylosignal2)
+row.names(icc_asv_phylosignal2)<-row.names(icc_asv_phylosignal)
+head(icc_asv_phylosignal2)
+names(icc_asv_phylosignal2)<-"ICC"
+table(is.na(icc_asv_phylosignal2$ICC))
+str(icc_asv_phylosignal2)
+dim(icc_asv_phylosignal2)
+#icc_asv_phylosignal2<-icc_asv_phylosignal2[tree$tip.label,]
+
+
+str(tree)
+tree$tip.label[1:5]
+head(icc_asv_phylosignal2)
+tree<-ape::collapse.singles(tree)
+
+p4d <- phylobase::phylo4d(tree,icc_asv_phylosignal2)
+phyloSignal(p4d, method = "all")
+
+barplot.phylo4d(p4d, tree.type = "phylo",tree.ladderize = T, bar.lwd = 3, show.tip = T, center = T, scale = F, trait.bg.col = "white", grid.col = "grey", tree.open.crown = 0, tip.adj = 1)
+
+scaled_icc<-as.numeric(scale(icc_asv_phylosignal2$ICC))
+colors<-ifelse(scaled_icc <=0, "black", "red")
+
+barplot.phylo4d(p4d, tree.type = "phylo",tree.ladderize = T, bar.lwd = 4, show.tip = T, center = T, scale = F,  grid.col = "grey", bar.col = colors, tip.col = colors, tip.cex = 0.7)
+
+
+```
+
+## 13c.Phylosignal: year
+
+```{r}
+icc_asv_phylosignal<-subset(icc_asv_df, effect == "Year")
+summary(icc_asv_phylosignal$ICC)
+head(icc_asv_phylosignal)
+
+row.names(icc_asv_phylosignal)<-icc_asv_phylosignal$New_Taxa
+icc_asv_phylosignal<-icc_asv_phylosignal[tree$tip.label,]
+
+icc_asv_phylosignal2<-data.frame(icc_asv_phylosignal[,c(2)])
+head(icc_asv_phylosignal2)
+row.names(icc_asv_phylosignal2)<-row.names(icc_asv_phylosignal)
+head(icc_asv_phylosignal2)
+names(icc_asv_phylosignal2)<-"ICC"
+table(is.na(icc_asv_phylosignal2$ICC))
+str(icc_asv_phylosignal2)
+dim(icc_asv_phylosignal2)
+#icc_asv_phylosignal2<-icc_asv_phylosignal2[tree$tip.label,]
+
+
+str(tree)
+tree$tip.label[1:5]
+head(icc_asv_phylosignal2)
+tree<-ape::collapse.singles(tree)
+
+p4d <- phylobase::phylo4d(tree,icc_asv_phylosignal2)
+phyloSignal(p4d, method = "all")
+
+barplot.phylo4d(p4d, tree.type = "phylo",tree.ladderize = F, bar.lwd = 3, show.tip = T, center = T, scale = F, trait.bg.col = "white", grid.col = "grey", tree.open.crown = 0, tip.adj = 1)
+
+scaled_icc<-as.numeric(scale(icc_asv_phylosignal2$ICC))
+summary(scaled_icc)
+colors<-ifelse(scaled_icc <=0, "black", "red")
+
+
+
+barplot.phylo4d(p4d, tree.type = "phylo",tree.ladderize = T, bar.lwd = 4, show.tip = T, center = T, scale = F,  grid.col = "grey", bar.col = colors, tip.col = colors, tip.cex = 0.7)
+
+```
+
+
+# 14. ICC and time
+
+```{r}
+
+library(reshape)
+
+metadata<-data.frame(sample_data(meerkat_icc_asv))
+head(metadata)
+metadata<-metadata[,c("IndividID", "feature.id", "SampleDate")]
+
+pairwise_metadata<-reshape::expand.grid.df(metadata, metadata)
+head(pairwise_metadata)
+names(pairwise_metadata)<-c("ID1", "Sample1", "Date1","ID2", "Sample2", "Date2" )
+
+pairwise_metadata$Within_ID<-pairwise_metadata$ID1 == pairwise_metadata$ID2
+pairwise_metadata$Within_sample<-pairwise_metadata$Sample1 == pairwise_metadata$Sample2
+dim(pairwise_metadata)
+head(pairwise_metadata)
+
+pairwise_metadata<-subset(pairwise_metadata, Within_ID==TRUE)
+pairwise_metadata<-subset(pairwise_metadata, Within_sample==FALSE)
+
+pairwise_metadata$TimeDifference<-as.numeric(pairwise_metadata$Date1-pairwise_metadata$Date2)
+
+pairwise_metadata<-subset(pairwise_metadata, TimeDifference>0)
+
+head(pairwise_metadata)
+
+pairwise_metadata %>% arrange(ID1, TimeDifference)
+
+
+plot(pairwise_metadata$TimeDifference)
+
+
+pairwise_metadata$Interval<-cut(pairwise_metadata$TimeDifference, breaks = c(0,30, 60,90, 120, 150, 180, 210, 240, 270, 300, 330, 360,  500, 1000,3500))
+#pairwise_metadata$Interval<-cut(pairwise_metadata$TimeDifference, breaks = c(0,30, 60,90, 120, 150, 210, 270, 330,  500,3500))
+
+table(pairwise_metadata$Interval)
+head(pairwise_metadata)
+
+############################
+
+unique(pairwise_metadata$Interval)
+
+pairwise_df_list<-as.list(pairwise_metadata %>%
+  group_split(Interval))
+
+### generate list of samples
+
+sample_list<-list()
+
+for (i in 1:length(pairwise_df_list)){
+
+df<-data.frame(pairwise_df_list[i])
+# df<-data.frame(pairwise_df_list[1])
+
+samples_to_keep<-as.character(c(df$Sample1, df$Sample2))
+
+sample_list[[i]]<-samples_to_keep
+#sample_list[[1]]<-samples_to_keep
+
+}
+
+names(sample_list)<-levels(pairwise_metadata$Interval)
+
+lengths(sample_list)
+
+
+#### start loop
+#### start loop
+#### start loop
+#### start loop
+
+#taxanames<-taxa_names(samples_90_core)
+
+icc_with_time_i<-list()
+icc_with_time_j<-list()
+
+for (j in 1:length(sample_list)){
+  print(sample_list[j])
+  
+samples_filtered<-prune_samples(sample_list[[j]], meerkat_icc_asv)
+#samples_filtered<-prune_samples(sample_list[[1]], scaled_core_asv)
+
+samples_filtered<-prune_taxa(taxa_sums(samples_filtered) > 0, samples_filtered)
+
+ ps_log <- transform(samples_filtered, 'log10')
+    
+    otutable<-data.frame(t(otu_table(ps_log)))
+    otutable[1:5,1:5]
+    names(otutable)<-taxa_names(ps_log)
+    
+    
+    dv_list<-names(otutable)
+    
+    otutable$IndividID<-sample_data(ps_log)$IndividID
+    otutable$GroupAtSampling<-sample_data(ps_log)$GroupAtSampling
+    otutable$Year<-as.factor(sample_data(ps_log)$Year)
+    otutable$Season<-as.factor(sample_data(ps_log)$Season)
+    otutable$HoursAfterSunrise<-sample_data(ps_log)$HoursAfterSunrise
+    otutable$AgeAtSamplingYears<-sample_data(ps_log)$AgeAtSamplingYears
+    otutable$Seq_depth_nospikein<-sample_data(ps_log)$Seq_depth_nospikein
+    otutable$Seq_run<-sample_data(ps_log)$Seq_run
+    otutable$Storage<-sample_data(ps_log)$Storage
+    
+    # standardise
+otutable$Seq_depth_nospikein<-as.numeric(scale(otutable$Seq_depth_nospikein))
+otutable$HoursAfterSunrise<-as.numeric(scale( otutable$HoursAfterSunrise))
+otutable$AgeAtSamplingYears<-as.numeric(scale(log10(otutable$AgeAtSamplingYears)))
+    
+    for (i in 1:length(dv_list)){
+       print(i)
+    
+    otutable1<-otutable[,c(dv_list[i],"HoursAfterSunrise", "Seq_depth_nospikein", "Seq_run", "Storage", "IndividID", "GroupAtSampling", "Year", "Season", "AgeAtSamplingYears")]
+   # otutable1<-otutable[,c(dv_list[1],"HoursAfterSunrise", "Seq_depth_nospikein", "Seq_run", "Storage", "IndividID", "GroupAtSampling", "Year", "Season", "AgeAtSamplingYears")]
+    names(otutable1)[1]<-"Variable"
+    
+     gammodel_log<- mgcv::bam(Variable~
+                         s(HoursAfterSunrise, bs = "cr")+
+                         s(Seq_depth_nospikein, bs = "cr")+
+                         s(AgeAtSamplingYears, bs = "cr")+
+                         Season+
+                           Storage+
+                         Seq_run+
+                        s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=otutable1,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+  
+ 
+   print(summary(gammodel_log))
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_log, nboot = 10, nperm = 0)
+    
+  # ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[7,"Year_adj"] # changed stat here because the other CIs didn't work
+upper_year_gam<- gam_boot$rpt[9,"Year_adj"] # changed stat here because the other CIs didn't work
+
+icc_results<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+icc_results$effect<-c("Year", "ID", "Group")
+names(icc_results)<-c("ICC", "lower", "upper", "effect")
+
+# add p value
+
+icc_results$p_val<-gam_boot$lrt$p_value
+icc_results$Significant <-icc_results$p_val < 0.051
+
+   icc_results$Phenotype<-dv_list[i]
+   icc_results$Category<-names(sample_list)[j]
+    
+    
+   
+    icc_with_time_i[[i]]<-icc_results
+    
+    }
+    
+icc_with_time_j[[j]]<-do.call(rbind,icc_with_time_i)
+
+}
+
+icc_df_time<-do.call(rbind, icc_with_time_j)
+
+head(icc_df_time)
+
+summary(icc_df_time$ICC)
+
+icc_df_time$Significant<-icc_df_time$p_val<0.051
+
+std <- function(x, na.rm = FALSE) {
+ if (na.rm) x <- na.omit(x)
+ sqrt(var(x) / length(x))
+}
+
+average_time_df<-icc_df_time %>% group_by(effect, Category) %>% summarise(median = median(ICC), sd = std(ICC))
+
+
+
+average_time_df
+average_time_df$lower<-average_time_df$median-average_time_df$sd
+average_time_df$upper<-average_time_df$median+average_time_df$sd
+
+average_time_df$effect<-factor(average_time_df$effect, levels = c("ID", "Group", "Year"))
+
+library(wesanderson)
+
+
+average_time_df$Category<-factor(average_time_df$Category, levels = names(sample_list))
+levels(average_time_df$Category)<- c("0-30", "30-60", "60-90", "90-120", "120-150", "150-180","180-210", "210-240", "240-270", "270-300", "300-330", "330-360", "360-500", "500-1000", ">1000")
+
+#View(average_time_df)
+
+levels(average_time_df$effect)<-c("ID", "Social group", "Year")
+
+fig4a<-ggplot(average_time_df, aes(x = Category, y = median, group = effect, fill = effect))+
+  geom_line(alpha = 0.7, aes(col = effect), size = 1)+
+  geom_point(size = 4, pch = 21)+
+  geom_errorbar(aes(ymin = lower, ymax = upper, col = effect), size = 1, width = 0.1)+
+  theme_clean(base_size = 16)+
+ scale_color_manual(values= wes_palette("FantasticFox1", n = 3)) +
+ scale_fill_manual(values= wes_palette("FantasticFox1", n = 3)) +
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+
+  ylab("ICC")+
+  xlab("Days between sampling")+
+  labs(col = "Variable", fill = "Variable")+
+   theme( 
+           legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_blank())+
+  theme(plot.background = element_rect(color = "white"))
+#write.csv(icc_df_time, "icc_df_time.csv")
+
+
+########### supplementary figure 
+
+unique(icc_df_time$Category)
+icc_df_time$Category<-factor(icc_df_time$Category, levels = names(sample_list))
+
+taxtable<-data.frame(tax_table(meerkat_icc_asv))
+head(taxtable)
+taxtable$ASV<-row.names(taxtable)
+
+icc_df_time$Genus<-vlookup(icc_df_time$Phenotype, taxtable, lookup_column = "ASV", result_column = "Genus")
+icc_df_time$Family<-vlookup(icc_df_time$Phenotype, taxtable, lookup_column = "ASV", result_column = "Family")
+
+icc_df_time$Genus<-ifelse(icc_df_time$Genus == "uncultured", paste(icc_df_time$Family), icc_df_time$Genus)
+
+icc_df_time$Category<-factor(icc_df_time$Category, levels = names(sample_list))
+levels(icc_df_time$Category)<- c("0-30", "30-60", "60-90", "90-120", "120-150", "150-180","180-210", "210-240", "240-270", "270-300", "300-330", "330-360", "360-500", "500-1000", ">1000")
+
+
+ggplot(subset(icc_df_time, effect == "ID"), aes(x = Category, y = ICC, label = Genus))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(width = 0.2, pch = 21, aes(fill = Significant))+
+  scale_fill_manual(values = c("grey", "red"))+
+  theme_clean(base_size = 16)+
+  ylab("ICC (identity)")+
+  xlab("Days between sampling")+
+   theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_blank())+
+  theme(plot.background = element_rect(color = "white"))+
+     theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+
+  xlab("Days between sampling")+
+  ggrepel::geom_text_repel(data = subset(icc_df_time, effect == "ID" & ICC > 0.31), max.overlaps = 100)
+
+
+summary(subset(icc_df_time, effect == "ID" & Category == "0-30")$ICC)
+```
+
+
+
+## 15. ICC and age
+
+```{r}
+
+
+
+sample_data(meerkat_icc_asv)$AgeCat<-ifelse(sample_data(meerkat_icc_asv)$AgeAtSamplingYears > 4, "OLD", as.character(sample_data(meerkat_icc_asv)$AgeCat))
+
+table(sample_data(meerkat_icc_asv)$AgeCat)
+
+
+
+ps_young<-subset_samples(meerkat_icc_asv,AgeCat == "YOUNG")
+ps_adult<-subset_samples(meerkat_icc_asv,AgeCat == "MIDDLEAGED"  )
+ps_old<-subset_samples(meerkat_icc_asv,AgeCat == "OLD"  )
+
+length(unique(sample_data(ps_old)$IndividID))
+length(unique(sample_data(ps_adult)$IndividID))
+length(unique(sample_data(ps_young)$IndividID))
+
+ps_age_list<-as.list(c(ps_young, ps_adult, ps_old))
+names(ps_age_list)<-c("YOUNG","ADULT", "OLD")
+
+icc_age_i<-list()
+icc_age_j<-list()
+
+ for (j in 1:length(ps_age_list)){
+   
+   ps<-ps_age_list[[j]]
+
+
+ ps_log <- transform(ps, 'log10')
+    
+    otutable<-data.frame(t(otu_table(ps_log)))
+    otutable[1:5,1:5]
+    names(otutable)<-taxa_names(ps_log)
+    
+    
+    dv_list<-names(otutable)
+    
+   otutable$IndividID<-sample_data(ps_log)$IndividID
+    otutable$GroupAtSampling<-sample_data(ps_log)$GroupAtSampling
+    otutable$Year<-as.factor(sample_data(ps_log)$Year)
+    otutable$Season<-as.factor(sample_data(ps_log)$Season)
+    otutable$HoursAfterSunrise<-sample_data(ps_log)$HoursAfterSunrise
+    otutable$AgeAtSamplingYears<-sample_data(ps_log)$AgeAtSamplingYears
+    otutable$Seq_depth_nospikein<-sample_data(ps_log)$Seq_depth_nospikein
+    otutable$Seq_run<-sample_data(ps_log)$Seq_run
+    otutable$Storage<-sample_data(ps_log)$Storage
+    
+    # standardise
+otutable$Seq_depth_nospikein<-as.numeric(scale(otutable$Seq_depth_nospikein))
+otutable$HoursAfterSunrise<-as.numeric(scale( otutable$HoursAfterSunrise))
+otutable$AgeAtSamplingYears<-as.numeric(scale(log10(otutable$AgeAtSamplingYears)))
+    
+    for (i in 1:length(dv_list)){
+       print(i)
+    
+    otutable1<-otutable[,c(dv_list[i],"HoursAfterSunrise", "Seq_depth_nospikein", "Seq_run", "Storage", "IndividID", "GroupAtSampling", "Year", "Season", "AgeAtSamplingYears")]
+   # otutable1<-otutable[,c(dv_list[1],"HoursAfterSunrise", "Seq_depth_nospikein", "Seq_run", "Storage", "IndividID", "GroupAtSampling", "Year", "Season", "AgeAtSamplingYears")]
+    names(otutable1)[1]<-"Variable"
+    
+     gammodel_log<- mgcv::bam(Variable~
+                         s(HoursAfterSunrise, bs = "cr")+
+                         s(Seq_depth_nospikein, bs = "cr")+
+                         s(AgeAtSamplingYears, bs = "cr")+
+                         Season+
+                           Storage+
+                         Seq_run+
+                        s(Year, bs = "re")+
+                         s(IndividID, bs = "re")+
+                         s(GroupAtSampling, bs = "re"),
+                       data=otutable1,
+                      correlation = nlme::corARMA(form = ~ 1|Year, p = 3),
+                       family = gaussian)
+  
+ 
+   print(summary(gammodel_log))
+
+gam_boot<-rptGam::rptgam(gamObj = gammodel_log, nboot = 10, nperm = 0)
+    
+  # ICC and CIs for ID
+icc_id_gam<- gam_boot$rpt[1,"IndividID_adj"] # icc
+lower_id_gam<- gam_boot$rpt[6,"IndividID_adj"]
+upper_id_gam<- gam_boot$rpt[8,"IndividID_adj"]
+
+
+# ICC and CIs for social group
+icc_group_gam<- gam_boot$rpt[1,"GroupAtSampling_adj"] # icc
+lower_group_gam<- gam_boot$rpt[6,"GroupAtSampling_adj"]
+upper_group_gam<- gam_boot$rpt[8,"GroupAtSampling_adj"]
+
+# ICC and CIs for year
+icc_year_gam<- gam_boot$rpt[1,"Year_adj"] # icc
+lower_year_gam<- gam_boot$rpt[7,"Year_adj"] # changed stat here because the other CIs didn't work
+upper_year_gam<- gam_boot$rpt[9,"Year_adj"] # changed stat here because the other CIs didn't work
+
+icc_results<-data.frame(rbind(c(icc_year_gam, lower_year_gam, upper_year_gam), c(icc_id_gam, lower_id_gam, upper_id_gam), c(icc_group_gam, lower_group_gam, upper_group_gam)))
+
+icc_results$effect<-c("Year", "ID", "Group")
+names(icc_results)<-c("ICC", "lower", "upper", "effect")
+
+# add p value
+
+icc_results$p_val<-gam_boot$lrt$p_value
+icc_results$Significant <-icc_results$p_val < 0.051
+
+   icc_results$Phenotype<-dv_list[i]
+   icc_results$Age<-names(ps_age_list)[j]
+    
+    
+    icc_age_i[[i]]<-icc_results
+    
+    }
+
+ icc_age_j[[j]]<-do.call(rbind,icc_age_i)
+ 
+ }
+    
+
+icc_age<-do.call(rbind, icc_age_j)
+head(icc_age)
+
+icc_age$Significant<-icc_age$p_val<0.051
+
+
+
+std <- function(x, na.rm = FALSE) {
+ if (na.rm) x <- na.omit(x)
+ sqrt(var(x) / length(x))
+}
+
+average_age_df<-icc_age %>% group_by(effect, Age) %>% summarise(median = median(ICC), sd = std(ICC))
+
+
+
+average_age_df
+average_age_df$lower<-average_age_df$median-average_age_df$sd
+average_age_df$upper<-average_age_df$median+average_age_df$sd
+
+#average_age_df$effect<-factor(average_age_df$effect, levels = c("ID", "Group", "Year"))
+
+library(wesanderson)
+
+unique(average_age_df$Age)
+average_age_df$Age<-factor(average_age_df$Age, levels = c("YOUNG", "ADULT", "OLD"))
+average_age_df$effect<-factor(average_age_df$effect, levels = c("ID", "Group", "Year"))
+
+levels(average_age_df$Age)<- c("0 - 2", "2 - 4", ">4")
+
+
+levels(average_age_df$effect)<-c("ID", "Social group", "Year")
+fig4b<-ggplot(average_age_df, aes(x = Age, y = median, group = effect, fill = effect))+
+  geom_line(alpha = 0.7, aes(col = effect), size = 1)+
+  geom_point(size = 4, pch = 21)+
+  geom_errorbar(aes(ymin = lower, ymax = upper, col = effect), size = 1, width = 0.1)+
+  theme_clean(base_size = 16)+
+ scale_color_manual(values= wes_palette("FantasticFox1", n = 3)) +
+ scale_fill_manual(values= wes_palette("FantasticFox1", n = 3)) +
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))+
+  ylab("")+
+  xlab("Age")+
+  labs(col = "Variable", fill = "Variable")+
+   theme( legend.title = element_text(size = 12),
+         legend.text = element_text(size = 12),
+         legend.background = element_blank(),
+        legend.box.background = element_blank())+
+  theme(plot.background = element_rect(color = "white"))+
+  scale_y_continuous(breaks = c(0,0.05,0.1, 0.15))
+
+
+fig4ab<-ggarrange(fig4a, fig4b, ncol = 2, common.legend = T, legend = "top", labels = c("a)","b)"), align = "h")
+
+
+subset(icc_age, effect == "ID") %>% group_by( Age, Significant) %>% summarize(count = n())
+```
+
+
+
+# 16. Turnover 
+
+Calculate mean turnover between consecutive samples
+
+```{r}
+
+memory.limit(1000000)
+
+samplenames<-sample_names(meerkat_icc_asv)
+
+meerkat_turnover<-prune_samples(samplenames, meerkat_filtered)
+meerkat_turnover<-subset_taxa(meerkat_turnover, taxa_sums(meerkat_turnover) > 0)
+
+
+
+sample_data(meerkat_turnover)<-sample_data(meerkat_turnover)[,c("IndividID","feature.id", "SampleDate","HoursAfterSunrise", "Condition_weight", "Seq_depth_nospikein", "Season", "AgeAtSamplingYears" )]
+head(sample_data(meerkat_turnover))
+
+samplecount<-data.frame(sample_data(meerkat_turnover)) %>% 
+  group_by(IndividID) %>% 
+  arrange(SampleDate) %>% 
+  mutate(SampleCount = row_number())
+
+
+samplecount<-samplecount%>%arrange(IndividID, SampleDate)
+
+sample_data(meerkat_turnover)$SampleCount<-vlookup(sample_data(meerkat_turnover)$feature.id, samplecount, lookup_column = "feature.id", result_column = "SampleCount")
+
+### add difference in days between samples to see if this is related to turnover
+
+metadata_1<-data.frame(sample_data(meerkat_turnover))%>% 
+  arrange(IndividID, SampleDate) %>% 
+  group_by(IndividID) %>% 
+  mutate(diff_date = c(0,diff(SampleDate)))  %>% 
+  mutate(diff_time = c(0,diff(HoursAfterSunrise))) %>%
+  mutate(diff_seqdepth = c(0,diff(Seq_depth_nospikein))) %>%
+  mutate(diff_condition = c(0,diff(Condition_weight))) %>%
+  mutate(previous_season = shift(Season)) %>%
+  mutate(previous_time = shift(HoursAfterSunrise)) %>%
+  mutate(previous_age = shift(AgeAtSamplingYears))
+  
+  #mutate(DT, D = lag(B) + C)
+  
+head(metadata_1)
+
+
+#View(metadata_1)
+# put NA first sample per individual since we can't calculate differences for those rows
+metadata_1$diff_date<-ifelse(metadata_1$SampleCount == 1, NA, metadata_1$diff_date)
+metadata_1$diff_time<-ifelse(metadata_1$SampleCount == 1, NA, metadata_1$diff_time)
+
+head(metadata_1)
+
+
+
+#####################
+
+sample_data(meerkat_turnover)<-sample_data(meerkat_turnover)[,c("IndividID","SampleCount")]
+
+ps_melt<-speedyseq::psmelt(meerkat_turnover)
+head(ps_melt)
+dim(ps_melt)
+ps_melt<-subset(ps_melt, Abundance > 0)
+
+
+
+#total: The default metric, calculates summed appearances and disappearances relative 
+#to total species richness across both time periods.
+
+#appearance: Calculates the number of species that appeared in the second time period 
+#relative to total species richness across both time periods.
+
+#disappearance: Calculates the number of species that disappeared in the second time 
+#period relative to total species richness across both time periods.
+memory.limit(1000000)
+
+KNZ_turnover <- turnover(df = ps_melt[,c("SampleCount","OTU","Abundance","IndividID")], 
+  time.var = "SampleCount", 
+  species.var = "OTU", 
+  abundance.var = "Abundance", 
+  replicate.var = "IndividID")
+
+#### add days between samples as column
+
+KNZ_turnover<-merge(KNZ_turnover, metadata_1, by = c("IndividID", "SampleCount"))
+
+head(KNZ_turnover)
+
+
+ggplot(KNZ_turnover, aes(y = diff_date, x = total, group = IndividID))+
+  geom_point()+
+  geom_smooth()+
+  xlab("Turnover")+
+  ylab("Days between samples")+
+  theme_bw(base_size = 16)
+
+cor.test(KNZ_turnover$total, KNZ_turnover$diff_date)
+
+###############################
+
+### modify / add metadata
+
+KNZ_turnover$TimeCat<-ifelse(abs(KNZ_turnover$diff_time) <5, "SMALL", "LARGE")
+KNZ_turnover$diff_time<-abs(KNZ_turnover$diff_time)
+KNZ_turnover$diff_condition<-abs(KNZ_turnover$diff_condition)
+
+
+metadata<-data.frame(sample_data(meerkat_filtered))
+head(metadata)
+
+KNZ_turnover$Age_years<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "AgeAtSamplingYears")
+KNZ_turnover$Month<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "month")
+KNZ_turnover$Sex<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "Sex")
+#KNZ_turnover$DaysTilDeath<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "DaysTilDeath")
+KNZ_turnover$SocialStatus<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "SocialStatus")
+KNZ_turnover$Season<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "Season")
+KNZ_turnover$AgeCat<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "AgeCat")
+KNZ_turnover$GroupAtSampling<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "GroupAtSampling")
+KNZ_turnover$Rainfall<-vlookup(KNZ_turnover$feature.id, metadata, lookup_column = "feature.id", result_column = "sum_rainfall_month")
+
+## scale Turnover around the mean
+KNZ_turnover$Turnover_scaled<-as.numeric(scale(KNZ_turnover$total, center = T, scale = T))
+hist(KNZ_turnover$Turnover_scaled)
+
+############## quantify change in seaosn ######
+
+KNZ_turnover<-KNZ_turnover %>% mutate(SeasonChange = case_when( (Season == "WET SUMMER" & previous_season == "WET SUMMER") ~ "Wet-Wet",
+                                                  (Season == "DRY WINTER" & previous_season == "DRY WINTER") ~ "Dry-Dry",
+                                                  (Season == "WET SUMMER" & previous_season == "DRY WINTER") ~ "Dry-Wet",
+                                                 (Season == "DRY WINTER" & previous_season == "WET SUMMER")~"Wet-Dry"))
+  
+str(KNZ_turnover)
+KNZ_turnover$SeasonChange<-factor(KNZ_turnover$SeasonChange, levels = c("Wet-Wet", "Dry-Dry", "Wet-Dry", "Dry-Wet"))
+
+head(KNZ_turnover)
+
+ggplot(KNZ_turnover, aes(x = AgeCat, y = Turnover_scaled))+geom_boxplot()+geom_jitter()
+ggplot(KNZ_turnover, aes(x = Age_years, y = Turnover_scaled))+geom_point()
+
+table(KNZ_turnover$SeasonChange)
+hist(sqrt(KNZ_turnover$Rainfall))
+
+############# categorise difference in time of day
+
+head(KNZ_turnover)
+KNZ_turnover<-KNZ_turnover %>% mutate(TimeChange = case_when( (HoursAfterSunrise < 5 & previous_time < 5) ~ "Morn-Morn",
+                                                  (HoursAfterSunrise >= 5 & previous_time >= 5) ~ "Aft-Aft",
+                                                  (HoursAfterSunrise < 5 & previous_time >= 5) ~ "Morn-Aft",
+                                                 (HoursAfterSunrise >= 5 & previous_time < 5)~"Aft-Morn"))
+
+table(KNZ_turnover$TimeChange)
+  
+KNZ_turnover$TimeChange<-factor(KNZ_turnover$TimeChange, levels = c("Morn-Morn", "Aft-Aft", "Morn-Aft", "Aft-Morn"))
+
+
+#######################
+
+KNZ_turnover$IndividID<-factor(KNZ_turnover$IndividID)
+
+KNZ_turnover<-subset(KNZ_turnover, diff_date < 360)
+
+ggplot(KNZ_turnover, aes(x = Age_years, y = previous_age))+geom_point()
+ggplot(KNZ_turnover, aes(x = HoursAfterSunrise, y = previous_time))+geom_point()
+
+hist(KNZ_turnover$total)
+hist(KNZ_turnover$total^2)
+
+ggpairs(KNZ_turnover[,c("diff_date", "diff_time", "Age_years", "previous_age", "HoursAfterSunrise" )])
+
+hist(as.numeric(KNZ_turnover$SampleDate - min(KNZ_turnover$SampleDate)))
+
+KNZ_turnover$Date<-as.numeric(KNZ_turnover$SampleDate - min(KNZ_turnover$SampleDate))
+library(lubridate)
+KNZ_turnover$Year<-lubridate::year(KNZ_turnover$SampleDate)
+KNZ_turnover$Year<-factor(KNZ_turnover$Year)
+
+# dont need temporal autocorrelation here
+str(KNZ_turnover)
+
+gammodel_log<- mgcv::bam(total~
+                         s(diff_date, bs = "cr")+
+                         s(previous_age, bs = "cr", k = 5)+
+                         s(Year, bs = "re", k = 20)+
+                        s(IndividID, bs = "re")+
+                        s(GroupAtSampling, bs = "re"),
+                       data=KNZ_turnover,
+                     # correlation = nlme::corAR(),
+                       family = gaussian)
+
+print(summary(gammodel_log))
+gratia::draw(gammodel_log, scales = "fixed")
+str(gammodel_log)
+sjPlot::tab_model(gammodel_log)
+
+
+library(broom)
+
+broom.mixed::tidy(gammodel_log)
+
+mgcv::gam.check(gammodel_log)
+
+
+
+fig4c<-gratia::draw(gammodel_log, select = 1)+
+  xlab("Days between sampling")+
+  ylab("ASV turnover")+
+ ggtitle("")+
+  theme_clean(base_size = 16)+
+  geom_hline(yintercept = 0, linetype = "dotted", col = "black", size = 1.5)+ 
+  theme(plot.title = element_text(size=14))+
+  theme(plot.background = element_rect(color = "white"))
+
+fig4d<-gratia::draw(gammodel_log, select = 2)+
+  xlab("Age (years)")+
+  ggtitle("")+
+  theme_clean(base_size = 16)+
+theme(axis.title.y = element_blank())+
+  geom_hline(yintercept = 0, linetype = "dotted", col = "black", size = 1.5)+ 
+  theme(plot.title = element_text(size=14))+
+  scale_x_continuous(breaks = c(0,2,4,6,8,10))+
+  scale_x_sqrt(breaks = c(0,1,2,3,4,5,6,7,8))+
+  theme(plot.background = element_rect(color = "white"))
+
+fig4cd<-ggarrange(fig4c,fig4d, ncol = 2, labels = c("c)","d)"))
+
+
+
+ggarrange(fig4ab, fig4cd, ncol = 1, nrow = 2, heights = c(1, 1), align = "hv")
+
+
+
+head(KNZ_turnover)
+
+p1<-ggplot(KNZ_turnover, aes(x = Age_years, y = previous_age))+
+  geom_point(alpha = 0.5, pch = 21, fill = "grey")+
+  theme_clean(base_size = 14)+
+  xlab("Age (years) at first sample")+
+  ylab("Age (years) at second sample")+
+  theme(plot.background = element_rect(color = "white"))
+
+p2<-ggplot(KNZ_turnover, aes(x = previous_age, y = diff_date))+
+  geom_point(alpha = 0.5, pch = 21, fill = "grey")+
+  theme_clean(base_size = 14)+
+  xlab("Age (years) at second sample")+
+  ylab("Days between sampling")+
+  theme(plot.background = element_rect(color = "white"))
+
+ggarrange(p1, p2, ncol = 2, labels = c("a)", "b)"))
+
+
+ggplot(KNZ_turnover, aes(x = previous_age, y = diff_date))+geom_point()+
+  theme(plot.background = element_rect(color = "white"))
+ggplot(KNZ_turnover, aes(x = Age_years, y = diff_time))+geom_point()+
+  theme(plot.background = element_rect(color = "white"))
+
+cor.test(KNZ_turnover$previous_age, KNZ_turnover$diff_date)
+cor.test(KNZ_turnover$Age_years, KNZ_turnover$diff_date)
+cor.test(KNZ_turnover$Age_years, KNZ_turnover$previous_age)
+```
+
